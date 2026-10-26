@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:listlens}",
+            "name": "Debug listlens-replay",
+            "target": "listlens-replay",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug listlens-replay"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:listlens}",
+            "name": "Release listlens-replay",
+            "target": "listlens-replay",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release listlens-replay"
+        }
+    ]
+}
