@@ -185,12 +185,16 @@ struct ContentView: View {
 	}
 
 	@ViewBuilder private var logSection: some View {
-		Section("What the model sees") {
+		Section {
 			ForEach(model.log.prefix(60)) { line in
 				Text(line.text)
 					.font(line.isEvent ? .footnote.weight(.semibold) : .caption.monospaced())
 					.foregroundStyle(line.isEvent ? .primary : .secondary)
 			}
+		} header: {
+			Text("What the model sees")
+		} footer: {
+			Text("Every trip is saved with its frames, video and log in Files › On My iPhone › ListLens › trips.")
 		}
 	}
 }

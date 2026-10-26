@@ -4,7 +4,8 @@ import Foundation
 public actor ShoppingSession {
 	public enum Update: Sendable {
 		case list(title: String, items: [ListItem])
-		case verdict(FrameVerdict, MuseClient.Reply)
+		/// One judged frame, with the exact JPEG that was sent.
+		case verdict(FrameVerdict, MuseClient.Reply, jpeg: Data)
 		case event(CartWatcher.Event)
 		case failure(String)
 	}
@@ -28,7 +29,7 @@ public actor ShoppingSession {
 		judge: FrameJudge,
 		list: any ListSource,
 		watcher: CartWatcher = CartWatcher(),
-		maxInFlight: Int = 3,
+		maxInFlight: Int = 4,
 		latestFrame: @escaping FrameProvider
 	) {
 		self.judge = judge
@@ -77,7 +78,7 @@ public actor ShoppingSession {
 		defer { inFlight -= 1 }
 		do {
 			let judgement = try await judge.judge(jpeg: jpeg, at: time, against: pending)
-			continuation?.yield(.verdict(judgement.verdict, judgement.reply))
+			continuation?.yield(.verdict(judgement.verdict, judgement.reply, jpeg: jpeg))
 			for event in watcher.ingest(judgement.verdict) {
 				if case .checkedOff(let itemID, _) = event {
 					try? await list.setChecked(itemID, true)
@@ -99,7 +100,8 @@ public actor ShoppingSession {
 		}
 	}
 
-	private var elapsed: TimeInterval {
+	/// Seconds since `start()`, the clock every verdict's `time` is measured on.
+	public var elapsed: TimeInterval {
 		guard let startedAt else {
 			return 0
 		}

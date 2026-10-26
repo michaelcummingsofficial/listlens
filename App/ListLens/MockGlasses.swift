@@ -68,7 +68,8 @@ final class ClipFrames: @unchecked Sendable {
 		asset = AVURLAsset(url: url)
 		generator = AVAssetImageGenerator(asset: asset)
 		generator.appliesPreferredTrackTransform = true
-		generator.requestedTimeToleranceBefore = .zero
+		// An exact time makes the generator decode from the last keyframe on every call, which stalls sampling.
+		generator.requestedTimeToleranceBefore = CMTime(value: 1, timescale: 10)
 		generator.requestedTimeToleranceAfter = CMTime(value: 1, timescale: 10)
 	}
 

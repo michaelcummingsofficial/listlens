@@ -28,6 +28,7 @@ final class AppModel {
 	private static let apiKeyAccount = "meta-model-api"
 	private static let drawsOnGlassesKey = "drawsOnGlasses"
 	private static let checkOffShownFor: Duration = .seconds(4)
+	private static let model = "muse-spark-1.3"
 
 	let glasses = GlassesLink()
 	var listTitle: String {
@@ -53,6 +54,9 @@ final class AppModel {
 	var errorMessage: String?
 
 	@ObservationIgnored private var session: ShoppingSession?
+	@ObservationIgnored private var trip: TripRecorder?
+	/// Where trips are saved. Visible in the Files app under On My iPhone › ListLens.
+	static let tripsFolder = URL.documentsDirectory.appending(path: "trips", directoryHint: .isDirectory)
 	@ObservationIgnored private var latencies: [Double] = []
 	@ObservationIgnored private var tasks: [Task<Void, Never>] = []
 	@ObservationIgnored private var checkOffTimer: Task<Void, Never>?
@@ -86,6 +90,13 @@ final class AppModel {
 		}
 		isShopping = true
 		log = []
+		do {
+			let trip = try TripRecorder(in: Self.tripsFolder, title: listTitle, items: items)
+			self.trip = trip
+			glasses.startRecording(to: trip.folder.appending(path: "glasses.mov"))
+		} catch {
+			append("Couldn't start recording this trip: \(error)", isEvent: false)
+		}
 		append("Start shopping", isEvent: true)
 		calls = 0
 		cost = 0
@@ -101,7 +112,7 @@ final class AppModel {
 		}
 		#endif
 		let session = ShoppingSession(
-			judge: FrameJudge(client: MuseClient(apiKey: apiKey)),
+			judge: FrameJudge(client: MuseClient(apiKey: apiKey, model: Self.model)),
 			list: LocalListSource(title: listTitle, items: items),
 			latestFrame: latestFrame
 		)
@@ -123,8 +134,12 @@ final class AppModel {
 	}
 
 	func stopShopping() async {
+		append("Stop shopping", isEvent: true)
 		await session?.stop()
 		session = nil
+		let videoStartedAt = await glasses.stopRecording()
+		await trip?.finish(title: listTitle, items: items, model: Self.model, videoStartedAt: videoStartedAt)
+		trip = nil
 		tasks.forEach { $0.cancel() }
 		tasks = []
 		checkOffTimer?.cancel()
@@ -135,8 +150,11 @@ final class AppModel {
 		preview = nil
 	}
 
+	/// The wearer checking or unchecking by hand, on the phone or the glasses.
 	func setChecked(_ itemID: ListItem.ID, _ isChecked: Bool) async {
 		if let session {
+			let time = await session.elapsed
+			await trip?.event(isChecked ? .wearerChecked : .wearerUnchecked, at: time, itemID: itemID, itemName: name(of: itemID))
 			await session.setChecked(itemID, isChecked)
 		} else if let index = items.firstIndex(where: { $0.id == itemID }) {
 			items[index].isChecked = isChecked
@@ -170,17 +188,46 @@ final class AppModel {
 		case .list(_, let latest):
 			items = latest
 			render()
-		case .verdict(let verdict, let reply):
+		case .verdict(let verdict, let reply, let jpeg):
 			record(reply)
 			append(describe(verdict, reply), isEvent: false)
-		case .event(.holding(let itemID, let seen)):
+			let items = self.items
+			Task { [trip] in await trip?.frame(jpeg, verdict: verdict, reply: reply, items: items) }
+		case .event(let event):
+			recordEvent(event)
+			show(event)
+		case .failure(let message):
+			append(message, isEvent: false)
+			Task { [trip, session] in
+				let time = await session?.elapsed ?? 0
+				await trip?.event(.failure, at: time, detail: message)
+			}
+		}
+	}
+
+	private func recordEvent(_ event: CartWatcher.Event) {
+		let (kind, itemID, seen): (RecordedEvent.Kind, ListItem.ID?, String?) = switch event {
+		case .holding(let itemID, let seen): (.holding, itemID, seen)
+		case .released: (.released, nil, nil)
+		case .checkedOff(let itemID, let seen): (.checkedOff, itemID, seen)
+		}
+		let itemName = itemID.map(name(of:))
+		Task { [trip, session] in
+			let time = await session?.elapsed ?? 0
+			await trip?.event(kind, at: time, itemID: itemID, itemName: itemName, detail: seen)
+		}
+	}
+
+	private func show(_ event: CartWatcher.Event) {
+		switch event {
+		case .holding(let itemID, let seen):
 			held = Held(name: name(of: itemID), seen: seen)
 			append("In hand: \(name(of: itemID))", isEvent: true)
 			render()
-		case .event(.released):
+		case .released:
 			held = nil
 			render()
-		case .event(.checkedOff(let itemID, let seen)):
+		case .checkedOff(let itemID, let seen):
 			held = nil
 			lastCheckOff = CheckOff(itemID: itemID, name: name(of: itemID), seen: seen)
 			append("Checked off \(name(of: itemID))", isEvent: true)
@@ -195,8 +242,6 @@ final class AppModel {
 				self?.render()
 			}
 			render()
-		case .failure(let message):
-			append(message, isEvent: false)
 		}
 	}
 
@@ -252,6 +297,7 @@ final class AppModel {
 			log.removeLast()
 		}
 		Self.writeToLogFile(text)
+		Task { [trip] in await trip?.log(text) }
 	}
 
 	/// Kept in Documents so a Mac can pull it with `xcrun devicectl device copy from`.

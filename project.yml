@@ -65,6 +65,8 @@ targets:
         NSBonjourServices:
           - _bonjour._tcp
         NSMicrophoneUsageDescription: ListLens keeps your glasses' microphone open while you shop, so it keeps working with your phone in your pocket.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

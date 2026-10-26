@@ -8,6 +8,10 @@ import ListLensCore
  *
  *     swift run listlens-replay clip.mov --list "Apples,Milk,Eggs"
  *
+ * Or replays a trip the app recorded (see Trip.swift):
+ *
+ *     swift run listlens-replay trip path/to/trip-folder [--rejudge]
+ *
  * The API key comes from MODEL_API_KEY or ~/.meta-model-api-key.
  */
 
@@ -29,13 +33,21 @@ func seconds(_ duration: Duration) -> Double {
 }
 
 var arguments = Array(CommandLine.arguments.dropFirst())
+if arguments.first == "trip", arguments.count >= 2 {
+	do {
+		try await replayTrip(URL(fileURLWithPath: arguments[1]), rejudge: arguments.contains("--rejudge"), apiKey: apiKey())
+	} catch {
+		fail("\(error)")
+	}
+	exit(0)
+}
 var listNames = ["Apples", "Milk", "Ground beef", "Frozen spinach", "Eggs", "Bananas"]
 if let flag = arguments.firstIndex(of: "--list"), flag + 1 < arguments.count {
 	listNames = arguments[flag + 1].split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
 	arguments.removeSubrange(flag...(flag + 1))
 }
 guard let path = arguments.first else {
-	fail("usage: listlens-replay <clip> [--list \"Apples,Milk,Eggs\"]")
+	fail("usage: listlens-replay <clip> [--list \"Apples,Milk,Eggs\"]\n       listlens-replay trip <trip folder> [--rejudge]")
 }
 guard let key = apiKey() else {
 	fail("Set MODEL_API_KEY or save the key to ~/.meta-model-api-key")

@@ -31,6 +31,7 @@ public final class GlassesLink {
 
 	@ObservationIgnored private let wearables = Wearables.shared
 	@ObservationIgnored private nonisolated let decoder = FrameDecoder()
+	@ObservationIgnored private nonisolated let video = VideoRecorder()
 	@ObservationIgnored private let mic = MicKeepAlive()
 	@ObservationIgnored private let tokens = ListenerTokenBag()
 	@ObservationIgnored private var session: DeviceSession?
@@ -134,6 +135,18 @@ public final class GlassesLink {
 		decoder.latestImage().flatMap { JPEG.encode($0) }
 	}
 
+	/// Saves the glasses camera stream to a movie file, as received, until `stopRecording()`.
+	public func startRecording(to url: URL) {
+		video.start(to: url)
+	}
+
+	/// Finishes the movie file and returns when its first frame arrived, or nil if none did.
+	public func stopRecording() async -> Date? {
+		let startedAt = video.startedAt
+		await video.stop()
+		return startedAt
+	}
+
 	/// Replaces everything on the glasses display. There is no partial update.
 	public func show(_ screen: FlexBox) async {
 		guard let display, isDisplayReady else {
@@ -199,6 +212,7 @@ public final class GlassesLink {
 			self.camera = camera
 			note("camera attached")
 			let decoder = self.decoder
+			let video = self.video
 			camera.stream.statePublisher.listen { [weak self] state in
 				Task { @MainActor in
 					self?.note("stream: \(state)")
@@ -213,6 +227,7 @@ public final class GlassesLink {
 			camera.stream.videoFramePublisher.listen { [weak self] frame in
 				let first = decoder.received == 0
 				decoder.decode(frame.sampleBuffer)
+				video.append(frame.sampleBuffer)
 				if first {
 					Task { @MainActor in
 						self?.note("first frame")
