@@ -1,0 +1,22 @@
+# Secrets
+.env
+.env.*
+*.key
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+.swiftpm/
+.build/
+
+# Node
+node_modules/
+
+# Test footage and model output stay local
+footage/
+results/
+
+.DS_Store
