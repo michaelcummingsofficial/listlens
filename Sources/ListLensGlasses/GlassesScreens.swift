@@ -33,7 +33,7 @@ public enum GlassesScreens {
 			}
 			for item in rows {
 				FlexBox(direction: .row, spacing: 12, crossAlignment: .center) {
-					Icon(name: item.isChecked ? .checkmarkCircle : .circle)
+					Icon(name: .checkmarkCircle, style: item.isChecked ? .filled : .outline)
 					Text(item.name, style: .body, color: item.isChecked ? .secondary : .primary)
 				}
 				.padding(12)

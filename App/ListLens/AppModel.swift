@@ -1,0 +1,262 @@
+import Foundation
+import ListLensCore
+import ListLensGlasses
+import Observation
+import UIKit
+
+@MainActor
+@Observable
+final class AppModel {
+	struct Held: Equatable {
+		let name: String
+		let seen: String
+	}
+
+	struct CheckOff: Equatable {
+		let itemID: ListItem.ID
+		let name: String
+		let seen: String
+	}
+
+	struct LogLine: Identifiable {
+		let id = UUID()
+		let text: String
+		let isEvent: Bool
+	}
+
+	private static let listKey = "list"
+	private static let apiKeyAccount = "meta-model-api"
+	private static let checkOffShownFor: Duration = .seconds(4)
+
+	let glasses = GlassesLink()
+	var listTitle: String {
+		didSet { save() }
+	}
+	var items: [ListItem] {
+		didSet { save() }
+	}
+	var apiKey: String {
+		didSet { Keychain.write(apiKey, for: Self.apiKeyAccount) }
+	}
+	private(set) var isShopping = false
+	private(set) var held: Held?
+	private(set) var lastCheckOff: CheckOff?
+	private(set) var log: [LogLine] = []
+	private(set) var calls = 0
+	private(set) var cost = 0.0
+	private(set) var medianLatency: Double?
+	private(set) var preview: UIImage?
+	var errorMessage: String?
+
+	@ObservationIgnored private var session: ShoppingSession?
+	@ObservationIgnored private var latencies: [Double] = []
+	@ObservationIgnored private var tasks: [Task<Void, Never>] = []
+	@ObservationIgnored private var checkOffTimer: Task<Void, Never>?
+
+	init() {
+		let saved = UserDefaults.standard.data(forKey: Self.listKey).flatMap { try? JSONDecoder().decode(SavedList.self, from: $0) }
+		listTitle = saved?.title ?? "Groceries"
+		items = saved?.items ?? ["Apples", "Milk", "Eggs", "Ground beef", "Frozen spinach"].map { ListItem(name: $0) }
+		apiKey = Keychain.read(Self.apiKeyAccount) ?? ""
+		importKeyFile()
+		glasses.onDisplayReady = { [weak self] in
+			self?.render()
+		}
+	}
+
+	var remaining: Int {
+		items.filter { !$0.isChecked }.count
+	}
+
+	func startShopping() async {
+		guard !apiKey.isEmpty else {
+			errorMessage = "Add your Meta Model API key in Settings first."
+			return
+		}
+		guard !isShopping else {
+			return
+		}
+		isShopping = true
+		log = []
+		calls = 0
+		cost = 0
+		latencies = []
+		medianLatency = nil
+		await glasses.start()
+		let glasses = self.glasses
+		let session = ShoppingSession(
+			judge: FrameJudge(client: MuseClient(apiKey: apiKey)),
+			list: LocalListSource(title: listTitle, items: items),
+			latestFrame: { glasses.latestJPEG() }
+		)
+		self.session = session
+		let updates = await session.start()
+		tasks.append(Task { [weak self] in
+			for await update in updates {
+				self?.apply(update)
+			}
+		})
+		tasks.append(Task { [weak self] in
+			while !Task.isCancelled {
+				if UIApplication.shared.applicationState == .active, let jpeg = glasses.latestJPEG() {
+					self?.preview = UIImage(data: jpeg)
+				}
+				try? await Task.sleep(for: .milliseconds(500))
+			}
+		})
+	}
+
+	func stopShopping() async {
+		await session?.stop()
+		session = nil
+		tasks.forEach { $0.cancel() }
+		tasks = []
+		checkOffTimer?.cancel()
+		glasses.stop()
+		isShopping = false
+		held = nil
+		lastCheckOff = nil
+		preview = nil
+	}
+
+	func setChecked(_ itemID: ListItem.ID, _ isChecked: Bool) async {
+		if let session {
+			await session.setChecked(itemID, isChecked)
+		} else if let index = items.firstIndex(where: { $0.id == itemID }) {
+			items[index].isChecked = isChecked
+		}
+	}
+
+	func undo(_ itemID: ListItem.ID) async {
+		checkOffTimer?.cancel()
+		lastCheckOff = nil
+		append("Undid \(name(of: itemID))", isEvent: true)
+		await setChecked(itemID, false)
+		render()
+	}
+
+	func addItem(_ name: String) {
+		let trimmed = name.trimmingCharacters(in: .whitespaces)
+		guard !trimmed.isEmpty else {
+			return
+		}
+		items.append(ListItem(name: trimmed))
+	}
+
+	func uncheckAll() {
+		for index in items.indices {
+			items[index].isChecked = false
+		}
+	}
+
+	private func apply(_ update: ShoppingSession.Update) {
+		switch update {
+		case .list(_, let latest):
+			items = latest
+			render()
+		case .verdict(let verdict, let reply):
+			record(reply)
+			append(describe(verdict, reply), isEvent: false)
+		case .event(.holding(let itemID, let seen)):
+			held = Held(name: name(of: itemID), seen: seen)
+			append("In hand: \(name(of: itemID))", isEvent: true)
+			render()
+		case .event(.released):
+			held = nil
+			render()
+		case .event(.checkedOff(let itemID, let seen)):
+			held = nil
+			lastCheckOff = CheckOff(itemID: itemID, name: name(of: itemID), seen: seen)
+			append("Checked off \(name(of: itemID))", isEvent: true)
+			UINotificationFeedbackGenerator().notificationOccurred(.success)
+			checkOffTimer?.cancel()
+			checkOffTimer = Task { [weak self] in
+				try? await Task.sleep(for: Self.checkOffShownFor)
+				guard !Task.isCancelled else {
+					return
+				}
+				self?.lastCheckOff = nil
+				self?.render()
+			}
+			render()
+		case .failure(let message):
+			append(message, isEvent: false)
+		}
+	}
+
+	/// Draws the current state on the glasses. Each send replaces the whole display.
+	private func render() {
+		guard glasses.isDisplayReady else {
+			return
+		}
+		let screen = if let check = lastCheckOff {
+			GlassesScreens.checkedOff(name: check.name, seen: check.seen, remaining: remaining) { [weak self] in
+				Task { @MainActor in await self?.undo(check.itemID) }
+			}
+		} else {
+			GlassesScreens.list(title: listTitle, items: items, holding: held.map { ($0.name, $0.seen) }) { [weak self] itemID in
+				Task { @MainActor in
+					guard let self, let item = self.items.first(where: { $0.id == itemID }) else {
+						return
+					}
+					await self.setChecked(itemID, !item.isChecked)
+				}
+			}
+		}
+		Task { await glasses.show(screen) }
+	}
+
+	private func record(_ reply: MuseClient.Reply) {
+		calls += 1
+		cost += reply.cost
+		latencies.append(Double(reply.latency.components.attoseconds) / 1e18 + Double(reply.latency.components.seconds))
+		medianLatency = latencies.sorted()[latencies.count / 2]
+	}
+
+	private func describe(_ verdict: FrameVerdict, _ reply: MuseClient.Reply) -> String {
+		let ms = Int((Double(reply.latency.components.attoseconds) / 1e15).rounded()) + Int(reply.latency.components.seconds) * 1000
+		let state = switch verdict.state {
+		case .empty: "·"
+		case .holding: "hold"
+		case .intoCart: "cart"
+		}
+		let match = verdict.itemID.map { name(of: $0) } ?? ""
+		let basket = verdict.inBasket.isEmpty ? "" : " · basket: \(verdict.inBasket.map(name(of:)).joined(separator: ", "))"
+		return String(format: "%6.1fs %@ %@ %@%@ · %d ms", verdict.time, state, match, verdict.seen, basket, ms)
+	}
+
+	private func append(_ text: String, isEvent: Bool) {
+		log.insert(LogLine(text: text, isEvent: isEvent), at: 0)
+		if log.count > 200 {
+			log.removeLast()
+		}
+	}
+
+	private func name(of itemID: ListItem.ID) -> String {
+		items.first(where: { $0.id == itemID })?.name ?? itemID
+	}
+
+	/// A key copied into Documents from a Mac (`xcrun devicectl device copy to`) moves into the keychain
+	/// on launch and the file is deleted, so a long key never has to be typed on the phone.
+	private func importKeyFile() {
+		let file = URL.documentsDirectory.appending(path: "meta-model-api-key")
+		guard let key = try? String(contentsOf: file, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) else {
+			return
+		}
+		try? FileManager.default.removeItem(at: file)
+		if !key.isEmpty {
+			apiKey = key
+		}
+	}
+
+	private func save() {
+		if let data = try? JSONEncoder().encode(SavedList(title: listTitle, items: items)) {
+			UserDefaults.standard.set(data, forKey: Self.listKey)
+		}
+	}
+}
+
+private struct SavedList: Codable {
+	let title: String
+	let items: [ListItem]
+}
