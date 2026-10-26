@@ -26,6 +26,7 @@ final class AppModel {
 
 	private static let listKey = "list"
 	private static let apiKeyAccount = "meta-model-api"
+	private static let drawsOnGlassesKey = "drawsOnGlasses"
 	private static let checkOffShownFor: Duration = .seconds(4)
 
 	let glasses = GlassesLink()
@@ -37,6 +38,9 @@ final class AppModel {
 	}
 	var apiKey: String {
 		didSet { Keychain.write(apiKey, for: Self.apiKeyAccount) }
+	}
+	var drawsOnGlasses: Bool {
+		didSet { UserDefaults.standard.set(drawsOnGlasses, forKey: Self.drawsOnGlassesKey) }
 	}
 	private(set) var isShopping = false
 	private(set) var held: Held?
@@ -58,9 +62,13 @@ final class AppModel {
 		listTitle = saved?.title ?? "Groceries"
 		items = saved?.items ?? ["Apples", "Milk", "Eggs", "Ground beef", "Frozen spinach"].map { ListItem(name: $0) }
 		apiKey = Keychain.read(Self.apiKeyAccount) ?? ""
+		drawsOnGlasses = UserDefaults.standard.object(forKey: Self.drawsOnGlassesKey) as? Bool ?? true
 		importKeyFile()
 		glasses.onDisplayReady = { [weak self] in
 			self?.render()
+		}
+		glasses.onLog = { [weak self] message in
+			self?.append("glasses: \(message)", isEvent: false)
 		}
 	}
 
@@ -78,16 +86,24 @@ final class AppModel {
 		}
 		isShopping = true
 		log = []
+		append("Start shopping", isEvent: true)
 		calls = 0
 		cost = 0
 		latencies = []
 		medianLatency = nil
+		glasses.drawsOnDisplay = drawsOnGlasses
 		await glasses.start()
 		let glasses = self.glasses
+		var latestFrame: ShoppingSession.FrameProvider = { glasses.latestJPEG() }
+		#if DEBUG
+		if let clip = MockGlasses.clip {
+			latestFrame = { await clip.latestJPEG() }
+		}
+		#endif
 		let session = ShoppingSession(
 			judge: FrameJudge(client: MuseClient(apiKey: apiKey)),
 			list: LocalListSource(title: listTitle, items: items),
-			latestFrame: { glasses.latestJPEG() }
+			latestFrame: latestFrame
 		)
 		self.session = session
 		let updates = await session.start()
@@ -98,7 +114,7 @@ final class AppModel {
 		})
 		tasks.append(Task { [weak self] in
 			while !Task.isCancelled {
-				if UIApplication.shared.applicationState == .active, let jpeg = glasses.latestJPEG() {
+				if UIApplication.shared.applicationState == .active, let jpeg = await latestFrame() {
 					self?.preview = UIImage(data: jpeg)
 				}
 				try? await Task.sleep(for: .milliseconds(500))
@@ -189,21 +205,26 @@ final class AppModel {
 		guard glasses.isDisplayReady else {
 			return
 		}
-		let screen = if let check = lastCheckOff {
-			GlassesScreens.checkedOff(name: check.name, seen: check.seen, remaining: remaining) { [weak self] in
-				Task { @MainActor in await self?.undo(check.itemID) }
-			}
-		} else {
-			GlassesScreens.list(title: listTitle, items: items, holding: held.map { ($0.name, $0.seen) }) { [weak self] itemID in
-				Task { @MainActor in
-					guard let self, let item = self.items.first(where: { $0.id == itemID }) else {
-						return
-					}
-					await self.setChecked(itemID, !item.isChecked)
+		let screen = GlassesScreens.list(title: listTitle, status: glassesStatus, items: items) { [weak self] itemID in
+			Task { @MainActor in
+				guard let self, let item = self.items.first(where: { $0.id == itemID }) else {
+					return
 				}
+				await self.setChecked(itemID, !item.isChecked)
 			}
 		}
 		Task { await glasses.show(screen) }
+	}
+
+	/// The gray text in the glasses header: what just happened, or how much is left.
+	private var glassesStatus: String {
+		if let lastCheckOff {
+			return "Got \(lastCheckOff.name)"
+		}
+		if let held {
+			return "\(held.name) in hand"
+		}
+		return remaining == 0 ? "All done" : "\(remaining) left"
 	}
 
 	private func record(_ reply: MuseClient.Reply) {
@@ -229,6 +250,20 @@ final class AppModel {
 		log.insert(LogLine(text: text, isEvent: isEvent), at: 0)
 		if log.count > 200 {
 			log.removeLast()
+		}
+		Self.writeToLogFile(text)
+	}
+
+	/// Kept in Documents so a Mac can pull it with `xcrun devicectl device copy from`.
+	private static func writeToLogFile(_ text: String) {
+		let file = URL.documentsDirectory.appending(path: "listlens.log")
+		let line = Data("\(Date.now.formatted(.iso8601)) \(text)\n".utf8)
+		if let handle = try? FileHandle(forWritingTo: file) {
+			handle.seekToEndOfFile()
+			handle.write(line)
+			try? handle.close()
+		} else {
+			try? line.write(to: file)
 		}
 	}
 

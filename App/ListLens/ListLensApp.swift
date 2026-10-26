@@ -7,6 +7,9 @@ struct ListLensApp: App {
 
 	init() {
 		GlassesLink.configure()
+		#if DEBUG
+		MockGlasses.startIfRequested()
+		#endif
 		_model = State(initialValue: AppModel())
 	}
 
@@ -16,6 +19,13 @@ struct ListLensApp: App {
 				.onOpenURL { url in
 					Task { await model.glasses.handle(url) }
 				}
+				#if DEBUG
+				.task {
+					if MockGlasses.glasses != nil {
+						await model.startShopping()
+					}
+				}
+				#endif
 		}
 	}
 }

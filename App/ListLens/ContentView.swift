@@ -31,7 +31,7 @@ struct ContentView: View {
 				}
 			}
 			.sheet(isPresented: $showingSettings) {
-				SettingsView(apiKey: $model.apiKey)
+				SettingsView(apiKey: $model.apiKey, drawsOnGlasses: $model.drawsOnGlasses)
 			}
 			.alert("Something went wrong", isPresented: Binding(
 				get: { model.errorMessage != nil },
@@ -67,7 +67,7 @@ struct ContentView: View {
 
 	private var glassesStatus: String {
 		switch model.glasses.phase {
-		case .idle: "Ready"
+		case .idle: model.glasses.hasActiveDevice ? "Ready" : "Put on your glasses"
 		case .connecting: "Connecting…"
 		case .streaming: model.glasses.isDisplayReady ? "Watching, display on" : "Watching"
 		case .failed(let message): message
@@ -76,6 +76,14 @@ struct ContentView: View {
 
 	@ViewBuilder private var shoppingSection: some View {
 		Section {
+			#if DEBUG
+			if let mock = MockGlasses.glasses {
+				MockDisplayPreview(glasses: mock)
+					.aspectRatio(1, contentMode: .fit)
+					.clipShape(RoundedRectangle(cornerRadius: 12))
+					.accessibilityHidden(true)
+			}
+			#endif
 			if model.isShopping {
 				if let preview = model.preview {
 					Image(uiImage: preview)
@@ -189,6 +197,7 @@ struct ContentView: View {
 
 private struct SettingsView: View {
 	@Binding var apiKey: String
+	@Binding var drawsOnGlasses: Bool
 	@Environment(\.dismiss) private var dismiss
 
 	var body: some View {
@@ -200,6 +209,11 @@ private struct SettingsView: View {
 						.autocorrectionDisabled()
 				} footer: {
 					Text("ListLens sends glasses frames to Muse Spark with this key. Create one at dev.meta.ai under API keys. It stays in this phone's keychain.")
+				}
+				Section {
+					Toggle("Show the list on the glasses", isOn: $drawsOnGlasses)
+				} footer: {
+					Text("Turn this off to keep another list app on the glasses display while ListLens watches the camera.")
 				}
 			}
 			.navigationTitle("Settings")

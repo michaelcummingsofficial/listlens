@@ -20,14 +20,23 @@ public final class GlassesLink {
 	public private(set) var phase: Phase = .idle
 	public private(set) var registration: RegistrationState
 	public private(set) var isDisplayReady = false
+	/// Glasses that are paired, connected and being worn. A session can only start on these.
+	public private(set) var hasActiveDevice = false
 	/// Runs whenever the display comes up, so the caller can draw the current screen.
 	public var onDisplayReady: (@MainActor () -> Void)?
+	/// Each step of connecting, for the phone's log.
+	public var onLog: (@MainActor (String) -> Void)?
+	/// Off leaves the glasses display to whatever else is showing, such as a list app's own glasses screen.
+	public var drawsOnDisplay = true
 
 	@ObservationIgnored private let wearables = Wearables.shared
 	@ObservationIgnored private nonisolated let decoder = FrameDecoder()
 	@ObservationIgnored private let mic = MicKeepAlive()
 	@ObservationIgnored private let tokens = ListenerTokenBag()
 	@ObservationIgnored private var session: DeviceSession?
+	/// Made at launch and kept: it needs time to find the glasses, so one made on demand
+	/// reports no eligible device.
+	@ObservationIgnored private let selector: AutoDeviceSelector
 	@ObservationIgnored private var camera: Camera?
 	@ObservationIgnored private var display: Display?
 	@ObservationIgnored private var tasks: [Task<Void, Never>] = []
@@ -39,9 +48,19 @@ public final class GlassesLink {
 
 	public init() {
 		registration = Wearables.shared.registrationState
+		let selector = AutoDeviceSelector(wearables: Wearables.shared)
+		self.selector = selector
+		hasActiveDevice = selector.activeDevice != nil
+		tasks.append(Task { [weak self] in
+			for await device in selector.activeDeviceStream() {
+				self?.hasActiveDevice = device != nil
+				self?.note(device == nil ? "no active glasses" : "glasses active")
+			}
+		})
 		tasks.append(Task { [weak self] in
 			for await state in Wearables.shared.registrationStateStream() {
 				self?.registration = state
+				self?.note("registration: \(state)")
 			}
 		})
 	}
@@ -58,17 +77,18 @@ public final class GlassesLink {
 
 	public func start() async {
 		guard session == nil else {
+			note("start ignored: a session already exists")
 			return
 		}
 		phase = .connecting
+		note("starting, registration \(registration)")
+		guard await waitForActiveDevice() else {
+			note("no active glasses after waiting")
+			phase = .failed("Put on your glasses and make sure they're connected in the Meta AI app.")
+			return
+		}
 		do {
-			if try await wearables.checkPermissionStatus(.camera) != .granted {
-				guard try await wearables.requestPermission(.camera) == .granted else {
-					phase = .failed("ListLens needs the glasses camera. Allow it in the Meta AI app.")
-					return
-				}
-			}
-			let session = try wearables.createSession(deviceSelector: AutoDeviceSelector(wearables: wearables))
+			let session = try wearables.createSession(deviceSelector: selector)
 			self.session = session
 			let states = session.stateStream()
 			let errors = session.errorStream()
@@ -79,11 +99,14 @@ public final class GlassesLink {
 			})
 			tasks.append(Task { [weak self] in
 				for await error in errors {
+					self?.note("session error: \(error)")
 					self?.phase = .failed(error.localizedDescription)
 				}
 			})
 			try session.start()
+			note("session start requested")
 		} catch {
+			note("start failed: \(error)")
 			phase = .failed(error.localizedDescription)
 			stop()
 		}
@@ -111,10 +134,6 @@ public final class GlassesLink {
 		decoder.latestImage().flatMap { JPEG.encode($0) }
 	}
 
-	public nonisolated var framesDecoded: Int {
-		decoder.frameCount
-	}
-
 	/// Replaces everything on the glasses display. There is no partial update.
 	public func show(_ screen: FlexBox) async {
 		guard let display, isDisplayReady else {
@@ -124,13 +143,42 @@ public final class GlassesLink {
 	}
 
 	private func sessionChanged(to state: DeviceSessionState, on session: DeviceSession) {
+		note("session: \(state)")
 		switch state {
 		case .started:
-			attachCamera(to: session)
+			Task { await cameraPermissionThenAttach(to: session) }
 		case .stopped:
 			stop()
 		default:
 			break
+		}
+	}
+
+	private func waitForActiveDevice(timeout: Duration = .seconds(15)) async -> Bool {
+		let deadline = ContinuousClock.now + timeout
+		while selector.activeDevice == nil, ContinuousClock.now < deadline {
+			try? await Task.sleep(for: .milliseconds(250))
+		}
+		return selector.activeDevice != nil
+	}
+
+	/// Asked once the session is up, as Meta's samples do. The first time, this opens Meta AI.
+	private func cameraPermissionThenAttach(to session: DeviceSession) async {
+		do {
+			let status = try await wearables.checkPermissionStatus(.camera)
+			note("camera permission: \(status)")
+			if status != .granted {
+				let answer = try await wearables.requestPermission(.camera)
+				note("camera permission answer: \(answer)")
+				guard answer == .granted else {
+					phase = .failed("ListLens needs the glasses camera. Allow it in the Meta AI app.")
+					return
+				}
+			}
+			attachCamera(to: session)
+		} catch {
+			note("camera permission failed: \(error)")
+			phase = .failed(error.localizedDescription)
 		}
 	}
 
@@ -149,25 +197,58 @@ public final class GlassesLink {
 				return
 			}
 			self.camera = camera
+			note("camera attached")
 			let decoder = self.decoder
+			camera.stream.statePublisher.listen { [weak self] state in
+				Task { @MainActor in
+					self?.note("stream: \(state)")
+					if state == .streaming {
+						self?.deviceArrived(on: session)
+					}
+				}
+			}.store(in: tokens)
+			camera.stream.errorPublisher.listen { [weak self] error in
+				Task { @MainActor in self?.note("stream error: \(error)") }
+			}.store(in: tokens)
 			camera.stream.videoFramePublisher.listen { [weak self] frame in
+				let first = decoder.received == 0
 				decoder.decode(frame.sampleBuffer)
-				if decoder.frameCount == 1 {
-					Task { @MainActor in self?.firstFrameArrived(on: session) }
+				if first {
+					Task { @MainActor in
+						self?.note("first frame")
+						self?.deviceArrived(on: session)
+					}
 				}
 			}.store(in: tokens)
 			camera.stream.start()
+			note("stream start requested")
 		} catch {
 			phase = .failed(error.localizedDescription)
 		}
 	}
 
-	/// The display and microphone wait for the first frame: a capability added before the glasses
-	/// have fully arrived fails without an error.
-	private func firstFrameArrived(on session: DeviceSession) {
+	/// The display and microphone wait until the camera is streaming: a capability added before the
+	/// glasses have fully arrived fails without an error.
+	private func deviceArrived(on session: DeviceSession) {
+		guard phase != .streaming else {
+			return
+		}
 		phase = .streaming
-		try? mic.start()
-		guard display == nil else {
+		do {
+			try mic.start()
+			note("microphone open")
+		} catch {
+			note("microphone failed: \(error)")
+		}
+		Task { [weak self] in
+			try? await Task.sleep(for: .seconds(3))
+			guard let self else {
+				return
+			}
+			self.note("after 3 s: \(self.decoder.received) frames received, \(self.decoder.frameCount) decoded, \(self.decoder.failures) failed")
+		}
+		guard display == nil, drawsOnDisplay else {
+			note(drawsOnDisplay ? "display already attached" : "leaving the glasses display alone")
 			return
 		}
 		do {
@@ -177,16 +258,23 @@ public final class GlassesLink {
 				Task { @MainActor in self?.displayChanged(to: state) }
 			}.store(in: tokens)
 			display.start()
+			note("display requested")
 		} catch {
+			note("display failed: \(error)")
 			phase = .failed("The glasses display didn't start: \(error.localizedDescription)")
 		}
 	}
 
 	private func displayChanged(to state: DisplayState) {
+		note("display: \(state)")
 		isDisplayReady = state == .started
 		if isDisplayReady {
 			onDisplayReady?()
 		}
+	}
+
+	private func note(_ message: String) {
+		onLog?(message)
 	}
 }
 #endif

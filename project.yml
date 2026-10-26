@@ -6,6 +6,9 @@ options:
 packages:
   ListLens:
     path: .
+  MetaWearables:
+    url: https://github.com/facebook/meta-wearables-dat-ios
+    exactVersion: 1.0.1
 targets:
   ListLens:
     type: application
@@ -17,6 +20,8 @@ targets:
         product: ListLensCore
       - package: ListLens
         product: ListLensGlasses
+      - package: MetaWearables
+        product: MWDATMockDevice
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: fun.displaylist.listlens

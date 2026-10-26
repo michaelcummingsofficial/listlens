@@ -14,8 +14,13 @@ final class FrameDecoder: @unchecked Sendable {
 	private var format: CMFormatDescription?
 	private var latest: CVPixelBuffer?
 	private(set) var frameCount = 0
+	private(set) var received = 0
+	private(set) var failures = 0
 
 	func decode(_ sample: CMSampleBuffer) {
+		lock.lock()
+		received += 1
+		lock.unlock()
 		if let pixels = CMSampleBufferGetImageBuffer(sample) {
 			store(pixels)
 			return
@@ -30,13 +35,18 @@ final class FrameDecoder: @unchecked Sendable {
 		let session = self.session
 		lock.unlock()
 		guard let session else {
+			countFailure()
 			return
 		}
-		VTDecompressionSessionDecodeFrame(session, sampleBuffer: sample, flags: [], infoFlagsOut: nil) { [weak self] status, _, pixels, _, _ in
+		let status = VTDecompressionSessionDecodeFrame(session, sampleBuffer: sample, flags: [], infoFlagsOut: nil) { [weak self] status, _, pixels, _, _ in
 			guard status == noErr, let pixels else {
+				self?.countFailure()
 				return
 			}
 			self?.store(pixels)
+		}
+		if status != noErr {
+			countFailure()
 		}
 	}
 
@@ -61,6 +71,14 @@ final class FrameDecoder: @unchecked Sendable {
 		format = nil
 		latest = nil
 		frameCount = 0
+		received = 0
+		failures = 0
+		lock.unlock()
+	}
+
+	private func countFailure() {
+		lock.lock()
+		failures += 1
 		lock.unlock()
 	}
 
